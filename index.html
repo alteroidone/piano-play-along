@@ -528,7 +528,7 @@ function playSeq(notes, bpm, onStep, onEnd){
 /* ---------- hearing a real piano ---------- */
 const yinBuf = new Float32Array(1100);
 function detectPitch(buf, sr){
-  const W = 1024;
+  const W = 2048;
   const tauMin = Math.max(2, Math.floor(sr / 1500));
   const tauMax = Math.min(Math.floor(sr / 90), buf.length - W - 1, yinBuf.length - 2);
   let run = 0, found = -1;
@@ -539,19 +539,23 @@ function detectPitch(buf, sr){
     run += s;
     yinBuf[tau] = run ? s * tau / run : 1;
   }
+  let best = -1, bestV = 1;
   for (let tau = tauMin; tau < tauMax; tau++) {
-    if (yinBuf[tau] < .15) {
+    if (yinBuf[tau] < bestV) { bestV = yinBuf[tau]; best = tau; }
+    if (yinBuf[tau] < .2) {
       while (tau + 1 < tauMax && yinBuf[tau + 1] < yinBuf[tau]) tau++;
       found = tau;
       break;
     }
   }
+  /* a real piano in a room is rarely a clean single tone (the last note is
+     still ringing, the room adds noise), so accept the clearest period too */
+  if (found < 0 && best > 0 && bestV < .45) found = best;
   if (found < 0) return 0;
   const a = yinBuf[found - 1], b = yinBuf[found], c = yinBuf[found + 1], den = a - 2 * b + c;
   return sr / (found + (den ? (a - c) / (2 * den) : 0));
 }
-const GATE = .008;
-const mic = {token:0, stream:null, src:null, an:null, buf:null, raf:0, tick:0,
+const mic = {token:0, stream:null, src:null, an:null, buf:null, raf:0, tick:0, floor:0,
              hist:[], quiet:0, cand:null, candN:0, lastM:null, onsetAt:-1e9, firedAt:-1e9};
 let micFail = false;
 const pill = $('#pill'), pillText = $('#pillText'), micLevel = $('#micLevel');
@@ -581,15 +585,19 @@ function startMic(){
   setPill('Waiting for the microphone…');
   navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false, noiseSuppression:false, autoGainControl:false}}).then(stream => {
     if (token !== mic.token || mode !== 'turn') { stream.getTracks().forEach(t => t.stop()); return; }
-    if (a.state === 'suspended') a.resume();
+    if (a.state !== 'running') a.resume();
     mic.stream = stream;
     mic.src = a.createMediaStreamSource(stream);
     mic.an = a.createAnalyser();
-    mic.an.fftSize = 2048;
-    mic.src.connect(mic.an);
-    mic.buf = new Float32Array(2048);
+    mic.an.fftSize = 4096;
+    /* keep only the band a piano tune lives in: cuts hum below and hiss above */
+    const hp = a.createBiquadFilter(), lp = a.createBiquadFilter();
+    hp.type = 'highpass'; hp.frequency.value = 70;
+    lp.type = 'lowpass'; lp.frequency.value = 2000;
+    mic.src.connect(hp); hp.connect(lp); lp.connect(mic.an);
+    mic.buf = new Float32Array(4096);
     mic.hist = []; mic.quiet = 0; mic.cand = null; mic.candN = 0; mic.lastM = null;
-    mic.onsetAt = -1e9; mic.firedAt = -1e9; mic.tick = 0;
+    mic.onsetAt = -1e9; mic.firedAt = -1e9; mic.tick = 0; mic.floor = 0;
     setPill('Listening for your piano');
     micLoop();
   }).catch(err => {
@@ -607,16 +615,21 @@ function micLoop(){
   let s = 0;
   for (let i = 0; i < buf.length; i++) s += buf[i] * buf[i];
   const rms = Math.sqrt(s / buf.length);
-  micLevel.style.width = Math.min(100, rms * 700).toFixed(0) + '%';
+  micLevel.style.width = Math.min(100, Math.sqrt(rms) * 400).toFixed(0) + '%';
+  /* follow the room's background level: drop to it fast, creep up slowly,
+     so the gate suits a quiet phone mic and a noisy room alike */
+  if (!mic.floor || rms < mic.floor) mic.floor = mic.floor ? mic.floor * .6 + rms * .4 : rms;
+  else mic.floor *= 1.003;
+  const gate = Math.max(.0008, mic.floor * 2.2);
   const prevMin = mic.hist.length ? Math.min.apply(null, mic.hist) : rms;
   mic.hist.push(rms);
   if (mic.hist.length > 5) mic.hist.shift();
-  if (rms < GATE) {
+  if (rms < gate) {
     if (++mic.quiet >= 4) { mic.lastM = null; mic.cand = null; mic.candN = 0; setPill('Listening for your piano'); }
     return;
   }
   mic.quiet = 0;
-  if (rms > 1.6 * prevMin) mic.onsetAt = now;
+  if (rms > 1.35 * prevMin) mic.onsetAt = now;
   const f = detectPitch(buf, ac.sampleRate);
   if (!f) { mic.cand = null; mic.candN = 0; return; }
   const m = Math.round(69 + 12 * Math.log2(f / 440));
